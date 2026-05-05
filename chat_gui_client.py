@@ -9,6 +9,7 @@ import socket
 import subprocess
 import threading
 import tkinter as tk
+import uuid
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import scrolledtext
@@ -165,6 +166,7 @@ class ChatGUI:
 
         # NLP chat history for summary/keywords
         self.normal_chat_history = []
+        self.seen_message_ids = set()
 
         self.host_var = tk.StringVar(value=self.default_host)
         self.port_var = tk.StringVar(value=str(self.default_port))
@@ -577,6 +579,12 @@ class ChatGUI:
                 elif msg.get("status") == "no-user":
                     self.append_log("That user is not online.")
             elif action == "exchange":
+                message_id = msg.get("message_id")
+                if message_id and message_id in self.seen_message_ids:
+                    continue
+                if message_id:
+                    self.seen_message_ids.add(message_id)
+
                 message_text = msg.get("message", "")
                 if message_text.startswith("GAME|"):
                     self.handle_game_message(message_text)
@@ -806,11 +814,10 @@ class ChatGUI:
 
     def is_normal_chat_message(self, message):
         """
-        Check if a message is a normal human chat message (not system, file, game, bot, etc.).
+        Check if a message is a normal human chat message (not system, file, game, bot, NLP, or command).
         """
         if not message:
             return False
-        # Exclude messages starting with or containing special prefixes
         exclude_prefixes = [
             "[System]", "[File]", "[Game]", "[NLP Summary]", "[NLP Keywords]",
             "Chatbot:", "GAME|", "FILE|", "/summary", "/keywords", "@bot", "@chatbot"
@@ -820,12 +827,71 @@ class ChatGUI:
                 return False
         return True
 
+    def is_sentiment_target_message(self, message):
+        """
+        Determine whether a message should be analyzed for sentiment.
+        This should only include normal user text messages.
+        """
+        return self.is_normal_chat_message(message)
+
     def add_to_normal_chat_history(self, message):
         """
         Add a message to the normal chat history if it's a normal chat message.
         """
         if self.is_normal_chat_message(message):
             self.normal_chat_history.append(message)
+
+    def analyze_sentiment(self, message):
+        """
+        Analyze sentiment via DeepSeek API and return Positive, Neutral, or Negative.
+        """
+        if not self.chatbot:
+            return "Neutral"
+
+        prompt = (
+            f"Classify the sentiment of the following chat message as exactly one of Positive, Neutral, or Negative. "
+            f"Return only the single word. Message: {message}"
+        )
+        try:
+            response = self.chatbot.chat(prompt)
+            normalized = response.strip().split()[0].capitalize()
+            if normalized in {"Positive", "Neutral", "Negative"}:
+                return normalized
+        except Exception:
+            pass
+        return "Neutral"
+
+    def format_message_with_sentiment(self, message, sentiment):
+        """
+        Attach the sentiment emoji and label to the original message text.
+        """
+        emoji_map = {
+            "Positive": "😊 [Positive]",
+            "Neutral": "😐 [Neutral]",
+            "Negative": "😡 [Negative]"
+        }
+        return f"{message} {emoji_map.get(sentiment, '😐 [Neutral]')}"
+
+    def send_exchange_message(self, message, message_id=None):
+        """
+        Send an exchange message with a unique ID and register it locally.
+        """
+        if message_id is None:
+            message_id = uuid.uuid4().hex
+        self.seen_message_ids.add(message_id)
+        self.send_json({
+            "action": "exchange",
+            "from": f"[{self.name}]",
+            "message": message,
+            "message_id": message_id
+        })
+
+    def send_sentiment_message(self, formatted_message):
+        """
+        Broadcast the sentiment-labeled message through the existing server flow.
+        """
+        self.send_exchange_message(formatted_message)
+        self.append_log(f"[{self.name}] {formatted_message}")
 
     def get_recent_normal_messages(self, limit=5):
         """
@@ -881,6 +947,15 @@ class ChatGUI:
         except Exception as exc:
             self.append_log(f"[System] NLP analysis failed: {exc}")
 
+    def process_sentiment_and_send(self, text):
+        """
+        Analyze sentiment in a thread and send the formatted message through the server.
+        """
+        sentiment = self.analyze_sentiment(text)
+        formatted_message = self.format_message_with_sentiment(text, sentiment)
+        self.add_to_normal_chat_history(text)
+        self.send_sentiment_message(formatted_message)
+
     def send_nlp_result(self, result_text):
         """
         Display the NLP result locally in the current GUI chat display only.
@@ -927,11 +1002,19 @@ class ChatGUI:
                 bot_thread.start()
             return
 
+        if self.is_sentiment_target_message(text):
+            self.message_var.set("")
+            threading.Thread(target=self.process_sentiment_and_send, args=(text,), daemon=True).start()
+            return
+
         # Normal user message (not targeting the bot)
-        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
+        message_id = uuid.uuid4().hex
+        self.seen_message_ids.add(message_id)
+        self.send_exchange_message(text, message_id=message_id)
         self.add_to_normal_chat_history(text)
         self.append_log(f"[{self.name}] {text}")
         self.message_var.set("")
+
 def main():
     parser = argparse.ArgumentParser(description="UP3 GUI chat client")
     parser.add_argument("--host", default="127.0.0.1", help="Server IP address")

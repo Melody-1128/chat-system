@@ -57,7 +57,8 @@ class Group:
         peer_in_group, group_key = self.find_group(peer)
         if peer_in_group == True:
             print(peer, "is talking already, connect!")
-            self.chat_grps[group_key].append(me)
+            if me not in self.chat_grps[group_key]:
+                self.chat_grps[group_key].append(me)
             self.members[me] = S_TALKING
         else:
             # otherwise, create a new group
