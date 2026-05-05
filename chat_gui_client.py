@@ -54,15 +54,16 @@ class TicTacToeGame:
         if self.game_over or not self.my_turn or self.board[row][col] != '':
             return
         self.board[row][col] = self.symbol
-        self.buttons[row][col].config(text=self.symbol)
+        self.buttons[row][col].config(text=self.symbol, state=tk.DISABLED)
         self.my_turn = False
         self.update_status()
-        self.parent_gui.send_game_message(f"MOVE|{row}|{col}|{self.symbol}")
+        print("[GAME DEBUG] local move:", row, col, self.symbol)
+        self.parent_gui.send_game_message("MOVE", row, col, self.symbol)
         self.check_game_end()
 
     def apply_remote_move(self, row, col, symbol):
         self.board[row][col] = symbol
-        self.buttons[row][col].config(text=symbol)
+        self.buttons[row][col].config(text=symbol, state=tk.DISABLED)
         self.my_turn = True
         self.update_status()
         self.check_game_end()
@@ -81,15 +82,15 @@ class TicTacToeGame:
             self.game_over = True
             if winner == self.symbol:
                 self.status_label.config(text="You win!")
-                self.parent_gui.send_game_message("RESULT|win")
+                self.parent_gui.send_game_message("RESULT", "win")
             else:
                 self.status_label.config(text="You lose!")
-                self.parent_gui.send_game_message("RESULT|lose")
+                self.parent_gui.send_game_message("RESULT", "lose")
             self.disable_buttons()
         elif all(self.board[i][j] != '' for i in range(3) for j in range(3)):
             self.game_over = True
             self.status_label.config(text="Draw!")
-            self.parent_gui.send_game_message("RESULT|draw")
+            self.parent_gui.send_game_message("RESULT", "draw")
             self.disable_buttons()
 
     def check_winner(self):
@@ -302,12 +303,13 @@ class ChatGUI:
             filename (str): file name
             filepath (str): local path where the file is saved
         """
-        display_text = f"[File] {sender} sent: {filename}"
-        self.history.append(display_text)
+        display_text = f"[File] {sender} sent: "
+        self.history.append(display_text + filename)
 
         self.chat_log.config(state=tk.NORMAL)
-        start_index = self.chat_log.index(tk.END)
         self.chat_log.insert(tk.END, display_text)
+        start_index = self.chat_log.index(tk.END)
+        self.chat_log.insert(tk.END, filename)
         end_index = self.chat_log.index(tk.END)
         tag_name = f"file_{self.next_file_tag_id}"
         self.next_file_tag_id += 1
@@ -315,10 +317,10 @@ class ChatGUI:
         self.chat_log.tag_add(tag_name, start_index, end_index)
         self.chat_log.tag_configure(tag_name, foreground="blue", underline=1)
         self.chat_log.tag_bind(tag_name, "<Button-1>", lambda e, p=filepath: self.open_file(p))
+        self.file_links[tag_name] = filepath
         self.chat_log.insert(tk.END, "\n")
         self.chat_log.see(tk.END)
         self.chat_log.config(state=tk.DISABLED)
-        self.file_links[tag_name] = filepath
 
     def open_emoji_popup(self):
         """
@@ -433,7 +435,8 @@ class ChatGUI:
         if not target:
             messagebox.showerror("Error", "Please select a user to start a game")
             return
-        if target not in self.user_list:
+        users = self.user_list.get(0, tk.END)
+        if target not in users:
             messagebox.showerror("Error", "Selected user is not online")
             return
         if target == self.name:
@@ -442,11 +445,11 @@ class ChatGUI:
         if self.game is not None:
             messagebox.showerror("Error", "You are already in a game")
             return
-        self.send_game_message(f"INVITE|{target}")
+        self.send_game_message("INVITE")
         # Open game window for initiator
         self.game = TicTacToeGame(self, target, True)
 
-    def send_game_message(self, content):
+    def send_game_message(self, action, *args):
         """
         Send a game message to the target user.
         """
@@ -454,14 +457,18 @@ class ChatGUI:
             print("Not connected to server")
             return
         target = self.target_var.get().strip()
-        message = f"GAME|{content}|{self.name}|{target}"
-        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": message})
+        payload_message = "|".join(["GAME", action, self.name, target] + [str(arg) for arg in args])
+        print("[GAME DEBUG] sending:", payload_message)
+        payload = {"action": "exchange", "from": f"[{self.name}]", "message": payload_message}
+        print("[GAME DEBUG] send_game_message payload:", payload)
+        self.send_json(payload)
 
     def handle_game_message(self, message):
         """
         Handle incoming game messages.
         """
         parts = message.split("|")
+        print("[GAME DEBUG] parsed game message:", parts)
         if len(parts) < 4:
             return
         action = parts[1]
@@ -473,14 +480,17 @@ class ChatGUI:
             if self.game is None:
                 self.game = TicTacToeGame(self, sender, False)
         elif action == "MOVE":
+            if sender == self.name:
+                return
             if self.game and len(parts) >= 7:
-                row, col, symbol = int(parts[4]), int(parts[5]), parts[6]
+                row = int(parts[4])
+                col = int(parts[5])
+                symbol = parts[6]
                 self.game.apply_remote_move(row, col, symbol)
         elif action == "RESET":
             if self.game:
                 self.game.reset_board_only()
         elif action == "RESULT":
-            # Game end is handled locally, but can log if needed
             pass
 
     def login(self):
@@ -567,10 +577,11 @@ class ChatGUI:
                 message_text = msg.get("message", "")
                 if message_text.startswith("GAME|"):
                     self.handle_game_message(message_text)
-                elif message_text.startswith("FILE|"):
+                    continue
+                if message_text.startswith("FILE|"):
                     self.handle_file_message(message_text)
-                else:
-                    self.append_log(f'{msg.get("from", "[peer]")} {message_text}')
+                    continue
+                self.append_log(f'{msg.get("from", "[peer]")} {message_text}')
             elif action == "disconnect":
                 self.connected_peer = ""
                 self.status_var.set(f"Logged in as {self.name}")
@@ -657,9 +668,12 @@ class ChatGUI:
             file_bytes = base64.b64decode(encoded_data)
             with open(filepath, "wb") as f:
                 f.write(file_bytes)
+            print("[FILE DEBUG] received FILE message:", filename)
+            print("[FILE DEBUG] saved to:", filepath)
             self.append_file_message(sender, filename, filepath)
         except Exception as exc:
-            self.append_log(f"[System] Failed to receive file: {exc}")
+            messagebox.showerror("File receive error", f"Could not receive file: {exc}")
+            print("[FILE DEBUG] failed to receive file:", exc)
 
     def request_user_list(self):
         if self.sock is None:
