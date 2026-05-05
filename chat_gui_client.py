@@ -47,7 +47,7 @@ class TicTacToeGame:
                 self.buttons[i][j] = ttk.Button(self.frame, text='', command=lambda r=i, c=j: self.make_move(r, c))
                 self.buttons[i][j].grid(row=i, column=j, ipadx=20, ipady=20)
 
-        self.reset_button = ttk.Button(self.window, text="Reset Game", command=self.reset_game)
+        self.reset_button = ttk.Button(self.window, text="Reset Game", command=self.reset_game_from_button)
         self.reset_button.pack(pady=10)
 
     def make_move(self, row, col):
@@ -108,7 +108,7 @@ class TicTacToeGame:
             return self.board[0][2]
         return None
 
-    def reset_game(self):
+    def reset_board_only(self):
         self.board = [['' for _ in range(3)] for _ in range(3)]
         self.game_over = False
         self.my_turn = self.is_initiator
@@ -116,6 +116,9 @@ class TicTacToeGame:
             for j in range(3):
                 self.buttons[i][j].config(text='', state=tk.NORMAL)
         self.update_status()
+
+    def reset_game_from_button(self):
+        self.reset_board_only()
         self.parent_gui.send_game_message("RESET")
 
     def disable_buttons(self):
@@ -423,9 +426,15 @@ class ChatGUI:
         """
         Start a Tic-Tac-Toe game with the selected target user.
         """
+        if not self.logged_in or self.sock is None:
+            messagebox.showerror("Error", "Please login and select a connected user before starting a game.")
+            return
         target = self.target_var.get().strip()
         if not target:
             messagebox.showerror("Error", "Please select a user to start a game")
+            return
+        if target not in self.user_list:
+            messagebox.showerror("Error", "Selected user is not online")
             return
         if target == self.name:
             messagebox.showerror("Error", "You cannot play against yourself")
@@ -441,6 +450,9 @@ class ChatGUI:
         """
         Send a game message to the target user.
         """
+        if self.sock is None:
+            print("Not connected to server")
+            return
         target = self.target_var.get().strip()
         message = f"GAME|{content}|{self.name}|{target}"
         self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": message})
@@ -466,7 +478,7 @@ class ChatGUI:
                 self.game.apply_remote_move(row, col, symbol)
         elif action == "RESET":
             if self.game:
-                self.game.reset_game()
+                self.game.reset_board_only()
         elif action == "RESULT":
             # Game end is handled locally, but can log if needed
             pass
