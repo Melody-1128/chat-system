@@ -8,16 +8,78 @@ import queue
 import socket
 import subprocess
 import threading
+import time
 import tkinter as tk
 import uuid
+import numpy as np
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import scrolledtext
 from tkinter import simpledialog
 from tkinter import ttk
 
+try:
+    import cv2
+    from PIL import Image, ImageTk
+except ImportError:
+    cv2 = None
+    Image = None
+    ImageTk = None
+
+VIDEO_PORT = 1113
+
 from chat_utils import CHAT_PORT, myrecv, mysend
 from deepseek_bot import DeepSeekChatBot
+
+
+def recvn(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def send_bytes(sock, data):
+    size_header = f"{len(data):010d}".encode('utf-8')
+    sock.sendall(size_header + data)
+
+
+def recv_bytes(sock):
+    size_data = recvn(sock, 10)
+    if not size_data:
+        return None
+    size = int(size_data.decode('utf-8'))
+    return recvn(sock, size)
+
+
+def send_json_binary(sock, obj):
+    payload = json.dumps(obj).encode('utf-8')
+    send_bytes(sock, payload)
+
+
+def recv_json_binary(sock):
+    raw = recv_bytes(sock)
+    if raw is None:
+        return None
+    return json.loads(raw.decode('utf-8'))
+
+
+def send_frame_packet(sock, metadata, frame_bytes):
+    send_json_binary(sock, metadata)
+    send_bytes(sock, frame_bytes or b'')
+
+
+def recv_frame_packet(sock):
+    metadata = recv_json_binary(sock)
+    if metadata is None:
+        return None, None
+    frame_bytes = recv_bytes(sock)
+    if frame_bytes is None:
+        return None, None
+    return metadata, frame_bytes
 
 
 class TicTacToeGame:
@@ -163,6 +225,7 @@ class ChatGUI:
         self.next_file_tag_id = 1
 
         self.game = None  # TicTacToeGame instance
+        self.video_call_client = None
 
         # NLP chat history for summary/keywords
         self.normal_chat_history = []
@@ -262,7 +325,10 @@ class ChatGUI:
         self.start_game_button = ttk.Button(bottom, text="Start Game", command=self.start_game)
         self.start_game_button.grid(row=0, column=7, sticky="ew")
 
-        for col in range(8):
+        self.video_call_button = ttk.Button(bottom, text="Video Call", command=self.start_video_call)
+        self.video_call_button.grid(row=0, column=8, sticky="ew")
+
+        for col in range(9):
             bottom.columnconfigure(col, weight=1 if col == 0 else 0)
         
         # Chatbot UI elements
@@ -291,6 +357,7 @@ class ChatGUI:
         self.disconnect_button.config(state=state)
         self.message_entry.config(state=state)
         self.send_button.config(state=state)
+        self.video_call_button.config(state=state)
 
     def append_log(self, text):
         self.history.append(text)
@@ -498,6 +565,89 @@ class ChatGUI:
         elif action == "RESULT":
             pass
 
+    def start_video_call(self):
+        if self.sock is None or not self.logged_in:
+            messagebox.showerror("Error", "Please login and select a connected user before starting a video call.")
+            return
+        target = self.target_var.get().strip()
+        if not target:
+            messagebox.showerror("Error", "Please select a user before starting a video call.")
+            return
+        if target == self.name:
+            messagebox.showerror("Error", "You cannot start a video call with yourself.")
+            return
+        if not self.connected_peer or self.connected_peer != target:
+            messagebox.showerror("Error", "You must be connected to the selected user before starting a video call.")
+            return
+        if self.video_call_client is not None:
+            messagebox.showwarning("Video Call", "A video call is already active.")
+            return
+        online_users = [self.user_list.get(i) for i in range(self.user_list.size())]
+        if target not in online_users:
+            messagebox.showerror("Error", "Selected user is not online.")
+            return
+
+        self.send_video_control_message("INVITE", target)
+        self.append_log(f"[Video] Invitation sent to {target}.")
+
+    def send_video_control_message(self, action, target):
+        payload = f"VIDEO|{action}|{self.name}|{target}"
+        print("[VIDEO DEBUG] sending invite:" if action == "INVITE" else "[VIDEO DEBUG] sending video control:", action, self.name, target)
+        self.send_exchange_message(payload)
+
+    def handle_video_message(self, message_text):
+        parts = message_text.split("|")
+        print("[VIDEO DEBUG] received video control:", message_text)
+        if len(parts) != 4:
+            return
+        action = parts[1]
+        sender = parts[2]
+        target = parts[3]
+        if self.name not in [sender, target]:
+            return
+
+        if action == "INVITE" and target == self.name:
+            if self.video_call_client is not None:
+                self.send_video_control_message("DECLINE", sender)
+                self.append_log(f"[Video] You are already in another call and declined the invitation from {sender}.")
+                return
+            accept = messagebox.askyesno("Video Call Invite", f"{sender} is inviting you to a video call.")
+            if accept:
+                self.send_video_control_message("ACCEPT", sender)
+                self.open_video_call_window(sender)
+            else:
+                self.send_video_control_message("DECLINE", sender)
+                self.append_log(f"[Video] You declined the call from {sender}.")
+        elif action == "ACCEPT" and target == self.name:
+            self.append_log(f"[Video] {sender} accepted the call.")
+            self.open_video_call_window(sender)
+        elif action == "DECLINE" and target == self.name:
+            self.append_log(f"[Video] {sender} declined the call.")
+        elif action == "END" and target == self.name:
+            self.append_log(f"[Video] {sender} ended the call.")
+            self.close_video_call()
+
+    def open_video_call_window(self, target):
+        if self.video_call_client is not None:
+            return
+        if cv2 is None or Image is None or ImageTk is None:
+            messagebox.showerror("Error", "Video support requires opencv-python and Pillow packages.")
+            return
+        if not self.logged_in:
+            messagebox.showerror("Error", "Please login before starting a video call.")
+            return
+
+        try:
+            self.video_call_client = VideoCallClient(self, target, self.name, self.host_var.get(), VIDEO_PORT)
+        except Exception as exc:
+            self.video_call_client = None
+            messagebox.showerror("Video Error", f"Could not start video call: {exc}")
+
+    def close_video_call(self):
+        if self.video_call_client is not None:
+            self.video_call_client.close()
+            self.video_call_client = None
+
     def login(self):
         if self.logged_in:
             return
@@ -586,6 +736,9 @@ class ChatGUI:
                     self.seen_message_ids.add(message_id)
 
                 message_text = msg.get("message", "")
+                if message_text.startswith("VIDEO|"):
+                    self.handle_video_message(message_text)
+                    continue
                 if message_text.startswith("GAME|"):
                     self.handle_game_message(message_text)
                     continue
@@ -735,6 +888,7 @@ class ChatGUI:
     def on_close(self):
         if self.game:
             self.game.on_close()
+        self.close_video_call()
         self.cleanup_connection()
         self.root.destroy()
 
@@ -1014,6 +1168,174 @@ class ChatGUI:
         self.add_to_normal_chat_history(text)
         self.append_log(f"[{self.name}] {text}")
         self.message_var.set("")
+
+
+class VideoCallClient:
+    def __init__(self, parent, target, local_name, host, port):
+        self.parent = parent
+        self.local_name = local_name
+        self.target = target
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.capture = None
+        self.running = False
+        self.remote_photo = None
+        self.local_photo = None
+        self.window = None
+        self.remote_label = None
+        self.local_label = None
+        self.send_thread = None
+        self.recv_thread = None
+
+        self._open_window()
+        self._connect_video_server()
+        self._start_video_stream()
+
+    def _open_window(self):
+        self.window = tk.Toplevel(self.parent.root)
+        self.window.title(f"Video Call with {self.target}")
+        self.window.geometry("720x520")
+        self.window.protocol("WM_DELETE_WINDOW", self.end_call_local)
+
+        frame = ttk.Frame(self.window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.remote_label = ttk.Label(frame, text="Waiting for remote video...", anchor="center")
+        self.remote_label.pack(fill=tk.BOTH, expand=True)
+
+        self.local_label = ttk.Label(self.window, text="Local preview", anchor="center")
+        self.local_label.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        end_button = ttk.Button(self.window, text="End Call", command=self.end_call_local)
+        end_button.pack(pady=(0, 10))
+
+    def _connect_video_server(self):
+        print("[VIDEO DEBUG] connecting to video server")
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5)
+            self.sock.connect((self.host, self.port))
+            self.sock.settimeout(None)
+            send_json_binary(self.sock, {"username": self.local_name, "target": self.target})
+        except Exception as exc:
+            self._cleanup_socket()
+            raise RuntimeError("Could not connect to video server. Make sure video_server.py is running.") from exc
+
+    def _start_video_stream(self):
+        self.capture = cv2.VideoCapture(0)
+        if self.capture is None or not self.capture.isOpened():
+            self._cleanup_socket()
+            raise RuntimeError("Could not access camera. Please check camera permissions and that the webcam is available.")
+
+        self.running = True
+        self.send_thread = threading.Thread(target=self._send_frames, daemon=True)
+        self.recv_thread = threading.Thread(target=self._receive_frames, daemon=True)
+        self.send_thread.start()
+        self.recv_thread.start()
+
+    def _send_frames(self):
+        while self.running:
+            try:
+                ret, frame = self.capture.read()
+                if not ret:
+                    continue
+                success, encoded = cv2.imencode('.jpg', frame)
+                if not success:
+                    continue
+                frame_bytes = encoded.tobytes()
+                metadata = {"type": "frame", "from": self.local_name, "target": self.target}
+                print("[VIDEO DEBUG] sending frame to:", self.target)
+                send_frame_packet(self.sock, metadata, frame_bytes)
+                self.parent.root.after(0, self._update_local_preview, frame)
+                time.sleep(0.03)
+            except Exception as exc:
+                print("[VIDEO DEBUG] send_frames error:", exc)
+                break
+        self.running = False
+
+    def _receive_frames(self):
+        while self.running:
+            try:
+                metadata, frame_bytes = recv_frame_packet(self.sock)
+                if metadata is None:
+                    break
+                if metadata.get("type") == "frame" and frame_bytes:
+                    sender = metadata.get("from")
+                    print("[VIDEO DEBUG] received remote frame from:", sender)
+                    self.parent.root.after(0, self._update_remote_preview, frame_bytes)
+                elif metadata.get("type") == "end":
+                    print("[VIDEO DEBUG] received remote end call")
+                    self.parent.root.after(0, self.parent.close_video_call)
+                    break
+            except Exception as exc:
+                print("[VIDEO DEBUG] receive_frames error:", exc)
+                break
+        self.running = False
+
+    def _update_remote_preview(self, frame_bytes):
+        try:
+            array = np.frombuffer(frame_bytes, dtype='uint8')
+            frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
+            if frame is None:
+                return
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame)
+            self.remote_photo = ImageTk.PhotoImage(image=image)
+            self.remote_label.config(image=self.remote_photo, text='')
+        except Exception as exc:
+            print("[VIDEO DEBUG] update_remote_preview error:", exc)
+
+    def _update_local_preview(self, frame):
+        try:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame)
+            image = image.resize((200, 150))
+            self.local_photo = ImageTk.PhotoImage(image=image)
+            self.local_label.config(image=self.local_photo, text='')
+        except Exception as exc:
+            print("[VIDEO DEBUG] update_local_preview error:", exc)
+
+    def end_call_local(self):
+        if self.parent and self.parent.name and self.target:
+            self.parent.send_video_control_message("END", self.target)
+        self.close()
+
+    def close(self):
+        self.running = False
+        if self.capture is not None:
+            try:
+                self.capture.release()
+            except Exception:
+                pass
+            self.capture = None
+        if self.sock is not None:
+            try:
+                send_json_binary(self.sock, {"type": "end", "from": self.local_name, "target": self.target})
+            except Exception:
+                pass
+            self._cleanup_socket()
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+        if self.parent:
+            self.parent.video_call_client = None
+
+    def _cleanup_socket(self):
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
 
 def main():
     parser = argparse.ArgumentParser(description="UP3 GUI chat client")

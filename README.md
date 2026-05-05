@@ -1,6 +1,6 @@
 # UP3 Chat Project
 
-A Python socket-based chat system with a Tkinter GUI client and a forwarding server. This project supports multi-user chat, file transfer, emoji input, chatbot integration, local NLP tools, sentiment analysis, and a two-player Tic-Tac-Toe game.
+A Python socket-based chat system with a Tkinter GUI client and a forwarding server. This project supports multi-user chat, file transfer, emoji input, chatbot integration, local NLP tools, sentiment analysis, Tic-Tac-Toe game, and two-person video calls.
 
 ## Features
 
@@ -17,28 +17,32 @@ A Python socket-based chat system with a Tkinter GUI client and a forwarding ser
   - `/keywords` → local keyword extraction
 - **Sentiment analysis** on outgoing user messages
 - **Tic-Tac-Toe game** between two selected users using `Start Game`
-- **Message deduplication** using unique IDs
+- **Two-person video call** with invite/accept/end flow
 
 ## Files
 
 - `chat_server.py` — main chat server
-- `chat_gui_client.py` — Tkinter GUI client with chat, file, game, NLP, sentiment, and chatbot features
+- `chat_gui_client.py` — Tkinter GUI client with chat, file, game, NLP, sentiment, and video features
 - `deepseek_bot.py` — DeepSeek API wrapper
 - `chat_utils.py` — socket framing utilities and protocol helpers
 - `chat_group.py` — chat group membership logic
+- `video_server.py` — video frame relay server
 
 ## Requirements
 
 - Python 3
 - `openai` Python package (DeepSeek-compatible SDK)
+- `opencv-python` (for video calls)
+- `Pillow` (for video display)
+- `numpy` (for video processing)
 - `DEEPSEEK_API_KEY` environment variable set before running the client
 
 ## Setup
 
-1. Install required Python package:
+1. Install required Python packages:
 
 ```bash
-pip3 install openai
+pip3 install openai opencv-python Pillow numpy
 ```
 
 2. Set the DeepSeek API key:
@@ -47,10 +51,11 @@ pip3 install openai
 export DEEPSEEK_API_KEY="your_api_key"
 ```
 
-3. Run the server:
+3. Run the servers:
 
 ```bash
-python3 chat_server.py
+python3 chat_server.py &
+python3 video_server.py &
 ```
 
 4. Launch one or more clients:
@@ -116,12 +121,19 @@ python3 chat_gui_client.py
 4. X starts first, and players alternate turns.
 5. The game only affects the two participants.
 
+### Video Call
+1. Select another online user and connect.
+2. Click **Video Call**.
+3. The selected opponent receives an invite and can accept or decline.
+4. When accepted, both users see each other's video.
+5. Click **End Call** to stop the video call.
+
 ## Notes
 
-- The server does not handle game logic; it only forwards `GAME|...` messages.
-- The client filters normal chat messages for NLP and sentiment analysis.
-- The system uses framed socket messaging from `chat_utils.py` to avoid broken JSON.
+- The chat server forwards control messages; video frames are relayed by a separate server.
+- Video uses OpenCV for capture and JPEG encoding.
 - Duplicate incoming messages are filtered with unique `message_id` values.
+
 
 ## Development
 
