@@ -163,6 +163,9 @@ class ChatGUI:
 
         self.game = None  # TicTacToeGame instance
 
+        # NLP chat history for summary/keywords
+        self.normal_chat_history = []
+
         self.host_var = tk.StringVar(value=self.default_host)
         self.port_var = tk.StringVar(value=str(self.default_port))
         self.name_var = tk.StringVar()
@@ -581,6 +584,8 @@ class ChatGUI:
                 if message_text.startswith("FILE|"):
                     self.handle_file_message(message_text)
                     continue
+                # Add to normal chat history if it's a normal message
+                self.add_to_normal_chat_history(message_text)
                 self.append_log(f'{msg.get("from", "[peer]")} {message_text}')
             elif action == "disconnect":
                 self.connected_peer = ""
@@ -799,6 +804,89 @@ class ChatGUI:
 
         self.root.after(100, self.process_bot_responses)
 
+    def is_normal_chat_message(self, message):
+        """
+        Check if a message is a normal human chat message (not system, file, game, bot, etc.).
+        """
+        if not message:
+            return False
+        # Exclude messages starting with or containing special prefixes
+        exclude_prefixes = [
+            "[System]", "[File]", "[Game]", "[NLP Summary]", "[NLP Keywords]",
+            "Chatbot:", "GAME|", "FILE|", "/summary", "/keywords", "@bot", "@chatbot"
+        ]
+        for prefix in exclude_prefixes:
+            if prefix in message or message.startswith(prefix):
+                return False
+        return True
+
+    def add_to_normal_chat_history(self, message):
+        """
+        Add a message to the normal chat history if it's a normal chat message.
+        """
+        if self.is_normal_chat_message(message):
+            self.normal_chat_history.append(message)
+
+    def get_recent_normal_messages(self, limit=5):
+        """
+        Get the most recent 'limit' normal chat messages.
+        """
+        return self.normal_chat_history[-limit:]
+
+    def handle_nlp_command(self, command):
+        """
+        Handle /summary or /keywords command.
+        """
+        recent_messages = self.get_recent_normal_messages()
+        if not recent_messages:
+            self.append_log("[System] No normal chat messages available for analysis.")
+            return
+
+        if command == "/summary":
+            self.append_log("[System] Generating summary...")
+            threading.Thread(target=self.generate_summary, args=(recent_messages,), daemon=True).start()
+        elif command == "/keywords":
+            self.append_log("[System] Extracting keywords...")
+            threading.Thread(target=self.generate_keywords, args=(recent_messages,), daemon=True).start()
+
+    def generate_summary(self, messages):
+        """
+        Generate a summary using DeepSeek API and send the result.
+        """
+        if not self.chatbot:
+            self.append_log("[System] DeepSeek API key is missing.")
+            return
+
+        prompt = f"Summarize the following recent chat messages in 1-2 concise sentences. Focus on the main discussion topic. Messages: {' '.join(messages)}"
+        try:
+            response = self.chatbot.generate_response(prompt)
+            result = f"[NLP Summary] {response.strip()}"
+            self.send_nlp_result(result)
+        except Exception as exc:
+            self.append_log(f"[System] NLP analysis failed: {exc}")
+
+    def generate_keywords(self, messages):
+        """
+        Generate keywords using DeepSeek API and send the result.
+        """
+        if not self.chatbot:
+            self.append_log("[System] DeepSeek API key is missing.")
+            return
+
+        prompt = f"Extract 5-8 key topics or frequently mentioned keywords from the following chat messages. Return only a comma-separated list. Messages: {' '.join(messages)}"
+        try:
+            response = self.chatbot.generate_response(prompt)
+            result = f"[NLP Keywords] {response.strip()}"
+            self.send_nlp_result(result)
+        except Exception as exc:
+            self.append_log(f"[System] NLP analysis failed: {exc}")
+
+    def send_nlp_result(self, result_text):
+        """
+        Send the NLP result as a normal chat message to broadcast to all users.
+        """
+        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": result_text})
+
     def send_message(self, _event=None):
         """
         Send a message. Detect @bot and @chatbot mentions.
@@ -814,6 +902,12 @@ class ChatGUI:
 
         if not self.connected_peer:
             messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
+            return
+
+        # Check for NLP commands
+        if text == "/summary" or text == "/keywords":
+            self.handle_nlp_command(text)
+            self.message_var.set("")
             return
 
         if "@bot" in text.lower() or "@chatbot" in text.lower():
@@ -834,6 +928,7 @@ class ChatGUI:
 
         # Normal user message (not targeting the bot)
         self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
+        self.add_to_normal_chat_history(text)
         self.append_log(f"[{self.name}] {text}")
         self.message_var.set("")
 def main():
