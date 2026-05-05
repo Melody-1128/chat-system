@@ -859,7 +859,7 @@ class ChatGUI:
 
         prompt = f"Summarize the following recent chat messages in 1-2 concise sentences. Focus on the main discussion topic. Messages: {' '.join(messages)}"
         try:
-            response = self.chatbot.generate_response(prompt)
+            response = self.chatbot.chat(prompt)
             result = f"[NLP Summary] {response.strip()}"
             self.send_nlp_result(result)
         except Exception as exc:
@@ -875,7 +875,7 @@ class ChatGUI:
 
         prompt = f"Extract 5-8 key topics or frequently mentioned keywords from the following chat messages. Return only a comma-separated list. Messages: {' '.join(messages)}"
         try:
-            response = self.chatbot.generate_response(prompt)
+            response = self.chatbot.chat(prompt)
             result = f"[NLP Keywords] {response.strip()}"
             self.send_nlp_result(result)
         except Exception as exc:
@@ -883,9 +883,10 @@ class ChatGUI:
 
     def send_nlp_result(self, result_text):
         """
-        Send the NLP result as a normal chat message to broadcast to all users.
+        Display the NLP result locally in the current GUI chat display only.
+        Do not send through server to avoid broadcasting to other users.
         """
-        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": result_text})
+        self.append_log(result_text)
 
     def send_message(self, _event=None):
         """
