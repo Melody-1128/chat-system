@@ -1,15 +1,131 @@
 import argparse
+import base64
+import datetime
 import json
+import os
+import platform
 import queue
 import socket
+import subprocess
 import threading
 import tkinter as tk
+from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import scrolledtext
+from tkinter import simpledialog
 from tkinter import ttk
 
 from chat_utils import CHAT_PORT, myrecv, mysend
 from deepseek_bot import DeepSeekChatBot
+
+
+class TicTacToeGame:
+    def __init__(self, parent_gui, opponent, is_initiator):
+        self.parent_gui = parent_gui
+        self.opponent = opponent
+        self.is_initiator = is_initiator
+        self.symbol = 'X' if is_initiator else 'O'
+        self.opponent_symbol = 'O' if is_initiator else 'X'
+        self.my_turn = is_initiator
+        self.board = [['' for _ in range(3)] for _ in range(3)]
+        self.game_over = False
+
+        self.window = tk.Toplevel(parent_gui.root)
+        self.window.title(f"Tic-Tac-Toe vs {opponent}")
+        self.window.geometry("300x350")
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.status_label = ttk.Label(self.window, text=f"You are {self.symbol}. {'Your turn.' if self.my_turn else 'Waiting for opponent.'}")
+        self.status_label.pack(pady=10)
+
+        self.frame = ttk.Frame(self.window)
+        self.frame.pack()
+
+        self.buttons = [[None for _ in range(3)] for _ in range(3)]
+        for i in range(3):
+            for j in range(3):
+                self.buttons[i][j] = ttk.Button(self.frame, text='', command=lambda r=i, c=j: self.make_move(r, c))
+                self.buttons[i][j].grid(row=i, column=j, ipadx=20, ipady=20)
+
+        self.reset_button = ttk.Button(self.window, text="Reset Game", command=self.reset_game)
+        self.reset_button.pack(pady=10)
+
+    def make_move(self, row, col):
+        if self.game_over or not self.my_turn or self.board[row][col] != '':
+            return
+        self.board[row][col] = self.symbol
+        self.buttons[row][col].config(text=self.symbol)
+        self.my_turn = False
+        self.update_status()
+        self.parent_gui.send_game_message(f"MOVE|{row}|{col}|{self.symbol}")
+        self.check_game_end()
+
+    def apply_remote_move(self, row, col, symbol):
+        self.board[row][col] = symbol
+        self.buttons[row][col].config(text=symbol)
+        self.my_turn = True
+        self.update_status()
+        self.check_game_end()
+
+    def update_status(self):
+        if self.game_over:
+            return
+        if self.my_turn:
+            self.status_label.config(text=f"You are {self.symbol}. Your turn.")
+        else:
+            self.status_label.config(text=f"You are {self.symbol}. Waiting for opponent.")
+
+    def check_game_end(self):
+        winner = self.check_winner()
+        if winner:
+            self.game_over = True
+            if winner == self.symbol:
+                self.status_label.config(text="You win!")
+                self.parent_gui.send_game_message("RESULT|win")
+            else:
+                self.status_label.config(text="You lose!")
+                self.parent_gui.send_game_message("RESULT|lose")
+            self.disable_buttons()
+        elif all(self.board[i][j] != '' for i in range(3) for j in range(3)):
+            self.game_over = True
+            self.status_label.config(text="Draw!")
+            self.parent_gui.send_game_message("RESULT|draw")
+            self.disable_buttons()
+
+    def check_winner(self):
+        # Check rows
+        for i in range(3):
+            if self.board[i][0] == self.board[i][1] == self.board[i][2] != '':
+                return self.board[i][0]
+        # Check columns
+        for j in range(3):
+            if self.board[0][j] == self.board[1][j] == self.board[2][j] != '':
+                return self.board[0][j]
+        # Check diagonals
+        if self.board[0][0] == self.board[1][1] == self.board[2][2] != '':
+            return self.board[0][0]
+        if self.board[0][2] == self.board[1][1] == self.board[2][0] != '':
+            return self.board[0][2]
+        return None
+
+    def reset_game(self):
+        self.board = [['' for _ in range(3)] for _ in range(3)]
+        self.game_over = False
+        self.my_turn = self.is_initiator
+        for i in range(3):
+            for j in range(3):
+                self.buttons[i][j].config(text='', state=tk.NORMAL)
+        self.update_status()
+        self.parent_gui.send_game_message("RESET")
+
+    def disable_buttons(self):
+        for i in range(3):
+            for j in range(3):
+                self.buttons[i][j].config(state=tk.DISABLED)
+
+    def on_close(self):
+        self.parent_gui.game = None
+        self.window.destroy()
 
 
 class ChatGUI:
@@ -35,6 +151,13 @@ class ChatGUI:
         self.personality_var = tk.StringVar(value="friendly")
         self.bot_initialized = False
         self.initialize_chatbot()  # Try to initialize on startup
+
+        # Emoji, file, and search state
+        self.history = []
+        self.file_links = {}
+        self.next_file_tag_id = 1
+
+        self.game = None  # TicTacToeGame instance
 
         self.host_var = tk.StringVar(value=self.default_host)
         self.port_var = tk.StringVar(value=str(self.default_port))
@@ -109,8 +232,29 @@ class ChatGUI:
         self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.message_entry.bind("<Return>", self.send_message)
 
+        self.emoji_button = ttk.Button(bottom, text="Emoji", command=self.open_emoji_popup)
+        self.emoji_button.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+
+        self.file_button = ttk.Button(bottom, text="Send File", command=self.send_file)
+        self.file_button.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+
+        self.time_button = ttk.Button(bottom, text="Time", command=self.display_time)
+        self.time_button.grid(row=0, column=3, sticky="ew", padx=(0, 4))
+
+        self.who_button = ttk.Button(bottom, text="Who", command=self.display_online_users)
+        self.who_button.grid(row=0, column=4, sticky="ew", padx=(0, 4))
+
+        self.search_button = ttk.Button(bottom, text="Search", command=self.search_history)
+        self.search_button.grid(row=0, column=5, sticky="ew", padx=(0, 4))
+
         self.send_button = ttk.Button(bottom, text="Send", command=self.send_message)
-        self.send_button.grid(row=0, column=1, sticky="ew")
+        self.send_button.grid(row=0, column=6, sticky="ew")
+
+        self.start_game_button = ttk.Button(bottom, text="Start Game", command=self.start_game)
+        self.start_game_button.grid(row=0, column=7, sticky="ew")
+
+        for col in range(8):
+            bottom.columnconfigure(col, weight=1 if col == 0 else 0)
         
         # Chatbot UI elements
         bot_frame = ttk.Frame(right)
@@ -140,10 +284,192 @@ class ChatGUI:
         self.send_button.config(state=state)
 
     def append_log(self, text):
+        self.history.append(text)
         self.chat_log.config(state=tk.NORMAL)
         self.chat_log.insert(tk.END, text.rstrip() + "\n")
         self.chat_log.see(tk.END)
         self.chat_log.config(state=tk.DISABLED)
+
+    def append_file_message(self, sender, filename, filepath):
+        """
+        Display a received file message with a clickable tag.
+
+        Args:
+            sender (str): sender name to display
+            filename (str): file name
+            filepath (str): local path where the file is saved
+        """
+        display_text = f"[File] {sender} sent: {filename}"
+        self.history.append(display_text)
+
+        self.chat_log.config(state=tk.NORMAL)
+        start_index = self.chat_log.index(tk.END)
+        self.chat_log.insert(tk.END, display_text)
+        end_index = self.chat_log.index(tk.END)
+        tag_name = f"file_{self.next_file_tag_id}"
+        self.next_file_tag_id += 1
+
+        self.chat_log.tag_add(tag_name, start_index, end_index)
+        self.chat_log.tag_configure(tag_name, foreground="blue", underline=1)
+        self.chat_log.tag_bind(tag_name, "<Button-1>", lambda e, p=filepath: self.open_file(p))
+        self.chat_log.insert(tk.END, "\n")
+        self.chat_log.see(tk.END)
+        self.chat_log.config(state=tk.DISABLED)
+        self.file_links[tag_name] = filepath
+
+    def open_emoji_popup(self):
+        """
+        Show an emoji picker popup and insert the selected emoji at the cursor.
+        """
+        emojis = ["😀", "😂", "👍", "❤️", "🎉", "😭", "😎"]
+        popup = tk.Toplevel(self.root)
+        popup.title("Choose Emoji")
+        popup.geometry("260x80")
+        popup.resizable(False, False)
+
+        def add_emoji(emoji):
+            self.insert_emoji(emoji)
+            popup.destroy()
+
+        for idx, emoji in enumerate(emojis):
+            button = ttk.Button(popup, text=emoji, command=lambda e=emoji: add_emoji(e))
+            button.grid(row=0, column=idx, padx=3, pady=10)
+
+    def insert_emoji(self, emoji):
+        """
+        Insert the selected emoji into the message input at the current cursor position.
+        """
+        index = self.message_entry.index(tk.INSERT)
+        current = self.message_var.get()
+        new_text = current[:index] + emoji + current[index:]
+        self.message_var.set(new_text)
+        self.message_entry.icursor(index + len(emoji))
+
+    def open_emoji_popup(self):
+        """
+        Show an emoji picker popup and insert the selected emoji at the cursor.
+        """
+        emojis = ["😀", "😂", "👍", "❤️", "🎉", "😭", "😎"]
+        popup = tk.Toplevel(self.root)
+        popup.title("Choose Emoji")
+        popup.geometry("260x80")
+        popup.resizable(False, False)
+
+        def add_emoji(emoji):
+            self.insert_emoji(emoji)
+            popup.destroy()
+
+        for idx, emoji in enumerate(emojis):
+            button = ttk.Button(popup, text=emoji, command=lambda e=emoji: add_emoji(e))
+            button.grid(row=0, column=idx, padx=3, pady=10)
+
+    def insert_emoji(self, emoji):
+        """
+        Insert the selected emoji into the message input at the current cursor position.
+        """
+        index = self.message_entry.index(tk.INSERT)
+        current = self.message_var.get()
+        new_text = current[:index] + emoji + current[index:]
+        self.message_var.set(new_text)
+        self.message_entry.icursor(index + len(emoji))
+
+    def open_file(self, filepath):
+        """
+        Open a file using the operating system default application.
+        """
+        if not os.path.exists(filepath):
+            self.append_log(f"[System] File not found: {filepath}")
+            return
+
+        try:
+            if platform.system() == "Darwin":
+                subprocess.run(["open", filepath], check=False)
+            elif platform.system() == "Windows":
+                os.startfile(filepath)
+            else:
+                subprocess.run(["xdg-open", filepath], check=False)
+        except Exception as exc:
+            self.append_log(f"[System] Could not open file: {exc}")
+
+    def display_time(self):
+        """
+        Display the current local time in the chat log.
+        """
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.append_log(f"[System] Current time: {now}")
+
+    def display_online_users(self):
+        """
+        Display the current online users from the user list.
+        """
+        users = [self.user_list.get(i) for i in range(self.user_list.size())]
+        display = ", ".join(users) if users else "No users online"
+        self.append_log(f"[System] Online users: {display}")
+
+    def search_history(self):
+        """
+        Prompt for a keyword and search the local chat history.
+        """
+        keyword = simpledialog.askstring("Search", "Enter keyword:")
+        if not keyword:
+            return
+
+        results = [msg for msg in self.history if keyword.lower() in msg.lower()]
+        self.append_log(f"[Search] Found {len(results)} results for \"{keyword}\"")
+        for msg in results:
+            self.append_log(f"[Search] {msg}")
+
+    def start_game(self):
+        """
+        Start a Tic-Tac-Toe game with the selected target user.
+        """
+        target = self.target_var.get().strip()
+        if not target:
+            messagebox.showerror("Error", "Please select a user to start a game")
+            return
+        if target == self.name:
+            messagebox.showerror("Error", "You cannot play against yourself")
+            return
+        if self.game is not None:
+            messagebox.showerror("Error", "You are already in a game")
+            return
+        self.send_game_message(f"INVITE|{target}")
+        # Open game window for initiator
+        self.game = TicTacToeGame(self, target, True)
+
+    def send_game_message(self, content):
+        """
+        Send a game message to the target user.
+        """
+        target = self.target_var.get().strip()
+        message = f"GAME|{content}|{self.name}|{target}"
+        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": message})
+
+    def handle_game_message(self, message):
+        """
+        Handle incoming game messages.
+        """
+        parts = message.split("|")
+        if len(parts) < 4:
+            return
+        action = parts[1]
+        sender = parts[2]
+        target = parts[3]
+        if self.name not in [sender, target]:
+            return  # Ignore if not involved
+        if action == "INVITE":
+            if self.game is None:
+                self.game = TicTacToeGame(self, sender, False)
+        elif action == "MOVE":
+            if self.game and len(parts) >= 7:
+                row, col, symbol = int(parts[4]), int(parts[5]), parts[6]
+                self.game.apply_remote_move(row, col, symbol)
+        elif action == "RESET":
+            if self.game:
+                self.game.reset_game()
+        elif action == "RESULT":
+            # Game end is handled locally, but can log if needed
+            pass
 
     def login(self):
         if self.logged_in:
@@ -226,7 +552,13 @@ class ChatGUI:
                 elif msg.get("status") == "no-user":
                     self.append_log("That user is not online.")
             elif action == "exchange":
-                self.append_log(f'{msg.get("from", "[peer]")} {msg.get("message", "")}')
+                message_text = msg.get("message", "")
+                if message_text.startswith("GAME|"):
+                    self.handle_game_message(message_text)
+                elif message_text.startswith("FILE|"):
+                    self.handle_file_message(message_text)
+                else:
+                    self.append_log(f'{msg.get("from", "[peer]")} {message_text}')
             elif action == "disconnect":
                 self.connected_peer = ""
                 self.status_var.set(f"Logged in as {self.name}")
@@ -256,6 +588,67 @@ class ChatGUI:
         if selection:
             self.target_var.set(self.user_list.get(selection[0]))
 
+    def send_file(self):
+        """
+        Open a file dialog, encode the selected file in base64, and send it over the socket.
+        """
+        if self.sock is None:
+            return
+        if not self.connected_peer:
+            messagebox.showwarning("Not chatting", "Connect to someone before sending a file.")
+            return
+
+        filename = filedialog.askopenfilename()
+        if not filename:
+            return
+
+        try:
+            filesize = os.path.getsize(filename)
+            if filesize > 5 * 1024 * 1024:
+                messagebox.showerror("File too large", "File must be smaller than 5MB.")
+                return
+
+            with open(filename, "rb") as f:
+                file_data = f.read()
+            encoded = base64.b64encode(file_data).decode("utf-8")
+            sender = self.name
+            basename = os.path.basename(filename)
+            packet = f"FILE|{sender}|{basename}|{encoded}"
+            self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": packet})
+            self.append_file_message(sender, basename, filename)
+        except Exception as exc:
+            messagebox.showerror("File send error", f"Could not send file: {exc}")
+
+    def _unique_received_filepath(self, filename):
+        """Generate a unique filepath for received files."""
+        os.makedirs("received_files", exist_ok=True)
+        base = os.path.basename(filename)
+        target = os.path.join("received_files", base)
+        name, ext = os.path.splitext(base)
+        counter = 1
+        while os.path.exists(target):
+            target = os.path.join("received_files", f"{name}_{counter}{ext}")
+            counter += 1
+        return target
+
+    def handle_file_message(self, message_text):
+        """
+        Parse a FILE| message and save the incoming file locally.
+        """
+        try:
+            parts = message_text.split("|", 3)
+            if len(parts) != 4:
+                raise ValueError("Invalid file message format")
+            _, sender, filename, encoded_data = parts
+            filename = os.path.basename(filename)
+            filepath = self._unique_received_filepath(filename)
+            file_bytes = base64.b64decode(encoded_data)
+            with open(filepath, "wb") as f:
+                f.write(file_bytes)
+            self.append_file_message(sender, filename, filepath)
+        except Exception as exc:
+            self.append_log(f"[System] Failed to receive file: {exc}")
+
     def request_user_list(self):
         if self.sock is None:
             return
@@ -275,68 +668,6 @@ class ChatGUI:
         self.connected_peer = ""
         self.status_var.set(f"Logged in as {self.name}")
         self.append_log("You left the current chat group.")
-
-    def send_message(self, _event=None):
-        if self.sock is None:
-            return
-
-        text = self.message_var.get().strip()
-        if not text:
-            return
-        
-        # Check if message is for the chatbot (starts with @bot)
-        if text.lower().startswith("@bot"):
-            # Extract the actual message (remove @bot prefix)
-            user_message = text[4:].strip()
-            if not user_message:
-                self.append_log("[Bot] Please provide a message after @bot")
-                self.message_var.set("")
-                return
-            
-            # Display user message
-            self.append_log(f"[{self.name}] @bot {user_message}")
-            self.message_var.set("")
-            
-            # Process bot request in a background thread (non-blocking)
-            bot_thread = threading.Thread(
-                target=self.process_bot_request,
-                args=(user_message,),
-                daemon=True
-            )
-            bot_thread.start()
-            return
-        
-        # Check for group chat mentions - if message contains @bot or @chatbot
-        if "@bot" in text.lower() or "@chatbot" in text.lower():
-            # Send message through socket first
-            if not self.connected_peer:
-                messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
-                return
-            
-            self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
-            self.append_log(f"[{self.name}] {text}")
-            self.message_var.set("")
-            
-            # Extract mention text for bot processing
-            mention_text = text.replace("@bot", "").replace("@chatbot", "").strip()
-            if mention_text:
-                # Process bot response in background thread (non-blocking)
-                bot_thread = threading.Thread(
-                    target=self.process_bot_request,
-                    args=(mention_text,),
-                    daemon=True
-                )
-                bot_thread.start()
-            return
-        
-        # Normal message (not for bot)
-        if not self.connected_peer:
-            messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
-            return
-
-        self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
-        self.append_log(f"[{self.name}] {text}")
-        self.message_var.set("")
 
     def send_json(self, payload):
         try:
@@ -363,6 +694,8 @@ class ChatGUI:
         self.status_var.set("Not connected")
 
     def on_close(self):
+        if self.game:
+            self.game.on_close()
         self.cleanup_connection()
         self.root.destroy()
 
@@ -422,22 +755,29 @@ class ChatGUI:
     def process_bot_responses(self):
         """
         Process responses from the bot background thread.
-        Display bot responses in the chat log.
+        Display bot responses in the chat log and forward them through the socket.
         """
         while not self.bot_responses.empty():
             response = self.bot_responses.get()
             if response.get("status") == "success":
-                self.append_log(f"Chatbot: {response.get('message', '')}")
+                bot_message = response.get('message', '')
+                self.append_log(f"Chatbot: {bot_message}")
+                if self.sock is not None and self.connected_peer:
+                    self.send_json({
+                        "action": "exchange",
+                        "from": "Chatbot:",
+                        "message": bot_message
+                    })
             elif response.get("status") == "error":
                 self.append_log(f"Chatbot: {response.get('message', 'Unknown error')}")
-        
+
         self.root.after(100, self.process_bot_responses)
 
     def send_message(self, _event=None):
         """
-        Send a message. Detect @bot prefix to route to chatbot.
-        If message starts with @bot, send to chatbot in background thread.
-        Otherwise send through normal socket chat.
+        Send a message. Detect @bot and @chatbot mentions.
+        Forward the original message through the socket, then call DeepSeek locally
+        for bot replies only on the sender side.
         """
         if self.sock is None:
             return
@@ -445,44 +785,19 @@ class ChatGUI:
         text = self.message_var.get().strip()
         if not text:
             return
-        
-        # Check if message is for the chatbot (starts with @bot)
-        if text.lower().startswith("@bot"):
-            # Extract the actual message (remove @bot prefix)
-            user_message = text[4:].strip()
-            if not user_message:
-                self.append_log("[Bot] Please provide a message after @bot")
-                self.message_var.set("")
-                return
-            
-            # Display user message
-            self.append_log(f"[{self.name}] @bot {user_message}")
-            self.message_var.set("")
-            
-            # Process bot request in a background thread (non-blocking)
-            bot_thread = threading.Thread(
-                target=self.process_bot_request,
-                args=(user_message,),
-                daemon=True
-            )
-            bot_thread.start()
+
+        if not self.connected_peer:
+            messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
             return
-        
-        # Check for group chat mentions - if message contains @bot or @chatbot
+
         if "@bot" in text.lower() or "@chatbot" in text.lower():
-            # Send message through socket first
-            if not self.connected_peer:
-                messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
-                return
-            
+            # Forward the original @bot message to the server so peers see it.
             self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
             self.append_log(f"[{self.name}] {text}")
             self.message_var.set("")
-            
-            # Extract mention text for bot processing
+
             mention_text = text.replace("@bot", "").replace("@chatbot", "").strip()
             if mention_text:
-                # Process bot response in background thread (non-blocking)
                 bot_thread = threading.Thread(
                     target=self.process_bot_request,
                     args=(mention_text,),
@@ -490,17 +805,11 @@ class ChatGUI:
                 )
                 bot_thread.start()
             return
-        
-        # Normal message (not for bot)
-        if not self.connected_peer:
-            messagebox.showwarning("Not chatting", "Connect to someone before sending a message.")
-            return
 
+        # Normal user message (not targeting the bot)
         self.send_json({"action": "exchange", "from": f"[{self.name}]", "message": text})
         self.append_log(f"[{self.name}] {text}")
         self.message_var.set("")
-
-
 def main():
     parser = argparse.ArgumentParser(description="UP3 GUI chat client")
     parser.add_argument("--host", default="127.0.0.1", help="Server IP address")
